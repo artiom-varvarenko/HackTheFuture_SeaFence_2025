@@ -47,8 +47,6 @@ public class MyClient implements HtfClientListener {
     public void onGameRoundServerMessage(HtfClient client, GameRoundServerMessage msg) throws Exception {
         GameRoundServerMessage.Submarine sub = msg.getOurSubmarine();
         GameRoundServerMessage.Values current = sub.getValues();
-        List<GameRoundServerMessage.Action> actions = msg.getActions();
-        List<GameRoundServerMessage.Effect> effects = msg.getEffects();
 
         if (ClientUtils.isDead(current)) {
             System.out.printf("Round %d | Submarine already destroyed. Sending no actions.%n", msg.getRound());
@@ -56,20 +54,14 @@ public class MyClient implements HtfClientListener {
             return;
         }
 
-        List<Long> chosenActions = planRoundActions(current, actions, effects);
+        // Use DecisionEngine for planning
+        DecisionEngine engine = new DecisionEngine();
+        List<Long> chosenActions = engine.planActions(msg);
         client.send(new SelectActionsClientMessage(msg.getRoundId(), chosenActions));
 
-        boolean dangerAhead = effects.stream().anyMatch(this::isHarmfulEffect);
-
-        System.out.printf(
-                "Round %d | Hull: %s | Crew: %s | Danger: %s | Steps: %d | Chosen: %s%n",
-                msg.getRound(),
-                current.getHullStrength(),
-                current.getCrewHealth(),
-                dangerAhead,
-                chosenActions.size(),
-                chosenActions
-        );
+        // Log trace
+        String trace = engine.getTraceLog();
+        System.out.print(trace);
     }
 
     /**
