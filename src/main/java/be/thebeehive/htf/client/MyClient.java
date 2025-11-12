@@ -321,7 +321,15 @@ public class MyClient implements HtfClientListener {
         BigDecimal currentHull   = safe(state.getHullStrength());
         BigDecimal currentCrew   = safe(state.getCrewHealth());
 
-        // Hard rule: if crew is critical, never accept crew damage
+        // CRITICAL: Reject any action that would lose > 30% of current crew
+        if (deltaCrew.compareTo(BigDecimal.ZERO) < 0 && currentCrew.compareTo(BigDecimal.ZERO) > 0) {
+            BigDecimal crewLossPercent = deltaCrew.abs().divide(currentCrew, 4, BigDecimal.ROUND_HALF_UP);
+            if (crewLossPercent.compareTo(new BigDecimal("0.30")) > 0) {
+                return BigDecimal.valueOf(-1_000_000);
+            }
+        }
+
+        // Hard rule: if crew is critical (absolute value), never accept crew damage
         if (currentCrew.compareTo(CRITICAL_CREW) <= 0
                 && deltaCrew.compareTo(BigDecimal.ZERO) < 0) {
             return BigDecimal.valueOf(-1_000_000);
@@ -354,9 +362,25 @@ public class MyClient implements HtfClientListener {
             crewWeight = crewWeight.add(new BigDecimal("2.0"));
         }
 
+        // Cap hull gains to prevent overvaluation
+        BigDecimal cappedHullDelta = deltaHull;
+        if (deltaHull.compareTo(new BigDecimal("20000")) > 0) {
+            cappedHullDelta = new BigDecimal("20000");
+        }
+
+        // Apply exponential penalty for crew losses based on percentage
+        BigDecimal crewScore = deltaCrew.multiply(crewWeight);
+        if (deltaCrew.compareTo(BigDecimal.ZERO) < 0 && currentCrew.compareTo(BigDecimal.ZERO) > 0) {
+            BigDecimal crewLossPercent = deltaCrew.abs().divide(currentCrew, 4, BigDecimal.ROUND_HALF_UP);
+            // Multiply penalty by (1 + 5 * percent^2) to heavily penalize larger percentages
+            BigDecimal percentSquared = crewLossPercent.multiply(crewLossPercent);
+            BigDecimal penaltyMultiplier = BigDecimal.ONE.add(percentSquared.multiply(new BigDecimal("5")));
+            crewScore = crewScore.multiply(penaltyMultiplier);
+        }
+
         BigDecimal score = BigDecimal.ZERO;
-        score = score.add(deltaHull.multiply(hullWeight));
-        score = score.add(deltaCrew.multiply(crewWeight));
+        score = score.add(cappedHullDelta.multiply(hullWeight));
+        score = score.add(crewScore);
         score = score.add(deltaMaxHull.multiply(maxHullWeight));
         score = score.add(deltaMaxCrew.multiply(maxCrewWeight));
 
