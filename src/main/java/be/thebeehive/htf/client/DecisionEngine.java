@@ -18,12 +18,12 @@ public class DecisionEngine {
     private static final int MAX_ACTIONS_PER_ROUND = 4;
     private static final long MAX_DECISION_TIME_MS = 300;
 
-    // Buffer thresholds
-    private static final BigDecimal HULL_BUFFER_THRESHOLD = new BigDecimal("0.35");
-    private static final BigDecimal CREW_BUFFER_THRESHOLD = new BigDecimal("0.40");
+    // Buffer thresholds - adjusted to be more conservative
+    private static final BigDecimal HULL_BUFFER_THRESHOLD = new BigDecimal("0.45");
+    private static final BigDecimal CREW_BUFFER_THRESHOLD = new BigDecimal("0.50");
 
     // Critical threshold for extra crew cost penalty
-    private static final BigDecimal CREW_CRITICAL_RATIO = new BigDecimal("0.35");
+    private static final BigDecimal CREW_CRITICAL_RATIO = new BigDecimal("0.40");
 
     private final long startTime;
     private final StringBuilder traceLog;
@@ -62,61 +62,178 @@ public class DecisionEngine {
     }
 
     /**
-     * Greedy earliest-death planner:
-     * 1. Simulate with no actions
-     * 2. If death at step s, insert best blocker for step-s effect at/before s
-     * 3. If no blocker saves, insert best heal at/before s
-     * 4. When safe, top up to buffers
+     * Enhanced planner with threat prioritization:
+     * 1. Pre-analyze ALL threats and sort by severity
+     * 2. Block the most severe threats first
+     * 3. Ensure total unavoidable damage is survivable before adding beneficial actions
+     * 4. Top up to buffers only when safe
      * 5. Append free upgrades if still safe
      */
     private List<Long> greedyEarliestDeathPlanner(Values initialState, List<Action> actions, List<Effect> effects) {
         List<Long> chosen = new ArrayList<>();
         Set<Long> usedActionIds = new HashSet<>();
 
-        // Phase 1: Ensure survival by blocking/healing
-        while (chosen.size() < MAX_ACTIONS_PER_ROUND && !isTimeout()) {
+        // Pre-analyze threats and sort by severity (largest damage first)
+        List<ThreatInfo> threats = analyzeThreats(effects);
+        traceLog.append(String.format("Analyzed %d threats\n", threats.size()));
+
+        // Phase 1: Block threats in order of severity
+        for (ThreatInfo threat : threats) {
+            if (chosen.size() >= MAX_ACTIONS_PER_ROUND || isTimeout()) break;
+
+            // Check if we still die with current actions
             SimulationResult result = simulate(initialState, chosen, actions, effects);
-
             if (result.survived) {
-                traceLog.append("Simulation survived all steps.\n");
-                break;
-            }
-
-            traceLog.append(String.format("Death at step %d | Hull: %s | Crew: %s\n",
-                    result.deathStep, result.deathState.hullStrength, result.deathState.crewHealth));
-
-            // Try to find a blocker for the deadly effect at deathStep
-            Action bestBlocker = findBestBlocker(result, initialState, actions, effects, usedActionIds, chosen);
-
-            if (bestBlocker != null) {
-                insertActionAtBestPosition(chosen, bestBlocker.getId(), result.deathStep, actions, effects);
-                usedActionIds.add(bestBlocker.getId());
-                traceLog.append(String.format("Inserted blocker %d\n", bestBlocker.getId()));
+                traceLog.append("Survived with current actions, checking next threat.\n");
                 continue;
             }
 
-            // No blocker found, try to insert best heal
+            // Try to block this threat if it contributes to death
+            Action blocker = findBlockerForEffect(threat.effect, actions, usedActionIds);
+
+            if (blocker != null) {
+                // Test if blocking this threat helps
+                List<Long> testActions = new ArrayList<>(chosen);
+                insertActionAtBestPosition(testActions, blocker.getId(), threat.effect.getStep(), actions, effects);
+                SimulationResult testResult = simulate(initialState, testActions, actions, effects);
+
+                if (testResult.survived || testResult.deathStep > result.deathStep) {
+                    insertActionAtBestPosition(chosen, blocker.getId(), threat.effect.getStep(), actions, effects);
+                    usedActionIds.add(blocker.getId());
+                    traceLog.append(String.format("Blocked threat %d (severity=%.0f) with action %d\n",
+                            threat.effect.getId(), threat.severity, blocker.getId()));
+                    continue;
+                }
+            }
+        }
+
+        // Phase 1b: If still dying, try to add heals/repairs to survive
+        int maxHealAttempts = 5;
+        int healAttempts = 0;
+        while (chosen.size() < MAX_ACTIONS_PER_ROUND && !isTimeout() && healAttempts < maxHealAttempts) {
+            SimulationResult result = simulate(initialState, chosen, actions, effects);
+
+            if (result.survived) {
+                traceLog.append("Survived after adding heals.\n");
+                break;
+            }
+
             Action bestHeal = findBestHeal(result, initialState, actions, effects, usedActionIds, chosen);
 
             if (bestHeal != null) {
                 insertActionAtBestPosition(chosen, bestHeal.getId(), result.deathStep, actions, effects);
                 usedActionIds.add(bestHeal.getId());
-                traceLog.append(String.format("Inserted heal %d\n", bestHeal.getId()));
-                continue;
+                traceLog.append(String.format("Added heal %d (attempt %d)\n", bestHeal.getId(), healAttempts + 1));
+                healAttempts++;
+            } else {
+                traceLog.append("No more heals available, cannot prevent death.\n");
+                break;
             }
-
-            // Cannot save ourselves
-            traceLog.append("Cannot prevent death, returning current actions.\n");
-            break;
         }
 
-        // Phase 2: Top up to buffers
-        topUpToBuffers(initialState, chosen, actions, effects, usedActionIds);
-
-        // Phase 3: Append free upgrades
-        appendFreeUpgrades(initialState, chosen, actions, effects, usedActionIds);
+        // Phase 2: Top up to buffers only if we're surviving
+        SimulationResult finalCheck = simulate(initialState, chosen, actions, effects);
+        if (finalCheck.survived) {
+            topUpToBuffers(initialState, chosen, actions, effects, usedActionIds);
+            appendFreeUpgrades(initialState, chosen, actions, effects, usedActionIds);
+        } else {
+            traceLog.append("WARNING: Not survived, skipping buffer top-up and upgrades.\n");
+        }
 
         return chosen;
+    }
+
+    /**
+     * Analyze all threats and sort by severity (largest damage first).
+     */
+    private List<ThreatInfo> analyzeThreats(List<Effect> effects) {
+        List<ThreatInfo> threats = new ArrayList<>();
+
+        for (Effect effect : effects) {
+            if (effect.getValues() == null) continue;
+
+            BigDecimal severity = calculateThreatSeverity(effect.getValues());
+            if (severity.compareTo(BigDecimal.ZERO) > 0) {
+                threats.add(new ThreatInfo(effect, severity));
+            }
+        }
+
+        // Sort by severity (descending), then by step (ascending)
+        threats.sort((a, b) -> {
+            int severityCompare = b.severity.compareTo(a.severity);
+            if (severityCompare != 0) return severityCompare;
+            return Integer.compare(a.effect.getStep(), b.effect.getStep());
+        });
+
+        return threats;
+    }
+
+    /**
+     * Calculate threat severity (total negative impact).
+     */
+    private BigDecimal calculateThreatSeverity(Values values) {
+        BigDecimal severity = BigDecimal.ZERO;
+
+        if (values.getHullStrength() != null && values.getHullStrength().compareTo(BigDecimal.ZERO) < 0) {
+            // Hull damage is critical
+            severity = severity.add(values.getHullStrength().abs().multiply(new BigDecimal("1.5")));
+        }
+
+        if (values.getCrewHealth() != null && values.getCrewHealth().compareTo(BigDecimal.ZERO) < 0) {
+            // Crew damage is also critical
+            severity = severity.add(values.getCrewHealth().abs().multiply(new BigDecimal("2.0")));
+        }
+
+        return severity;
+    }
+
+    /**
+     * Find a blocker action for a specific effect.
+     */
+    private Action findBlockerForEffect(Effect effect, List<Action> actions, Set<Long> usedActionIds) {
+        Action bestBlocker = null;
+        BigDecimal bestScore = new BigDecimal("-999999");
+
+        for (Action action : actions) {
+            if (action.getEffectId() == effect.getId() && !usedActionIds.contains(action.getId())) {
+                // Prefer blockers with minimal crew cost
+                BigDecimal score = BigDecimal.ZERO;
+
+                if (action.getValues() != null) {
+                    // Penalize crew costs heavily
+                    if (action.getValues().getCrewHealth() != null &&
+                        action.getValues().getCrewHealth().compareTo(BigDecimal.ZERO) < 0) {
+                        score = score.add(action.getValues().getCrewHealth());
+                    }
+
+                    // Reward hull/crew gains
+                    if (action.getValues().getHullStrength() != null &&
+                        action.getValues().getHullStrength().compareTo(BigDecimal.ZERO) > 0) {
+                        score = score.add(action.getValues().getHullStrength().multiply(new BigDecimal("0.5")));
+                    }
+                }
+
+                if (score.compareTo(bestScore) > 0) {
+                    bestScore = score;
+                    bestBlocker = action;
+                }
+            }
+        }
+
+        return bestBlocker;
+    }
+
+    /**
+     * Threat information for prioritization.
+     */
+    private static class ThreatInfo {
+        final Effect effect;
+        final BigDecimal severity;
+
+        ThreatInfo(Effect effect, BigDecimal severity) {
+            this.effect = effect;
+            this.severity = severity;
+        }
     }
 
     /**
@@ -170,128 +287,55 @@ public class DecisionEngine {
         return new SimulationResult(true, -1, state.copy());
     }
 
-    /**
-     * Find the best blocker for the effect causing death at deathStep.
-     */
-    private Action findBestBlocker(SimulationResult result, Values initialState, List<Action> actions,
-                                   List<Effect> effects, Set<Long> usedActionIds, List<Long> currentActions) {
-        // Find effects at deathStep
-        List<Effect> deathStepEffects = effects.stream()
-                .filter(e -> e.getStep() == result.deathStep)
-                .collect(Collectors.toList());
-
-        Action bestBlocker = null;
-        BigDecimal bestScore = new BigDecimal("-999999");
-
-        for (Effect effect : deathStepEffects) {
-            // Find actions that can block this effect
-            for (Action action : actions) {
-                if (action.getEffectId() == effect.getId() && !usedActionIds.contains(action.getId())) {
-                    // Score this blocker
-                    BigDecimal score = scoreBlocker(action, effect, initialState);
-
-                    // Check if inserting this action keeps us safe
-                    List<Long> testActions = new ArrayList<>(currentActions);
-                    insertActionAtBestPosition(testActions, action.getId(), result.deathStep, actions, effects);
-
-                    SimulationResult testResult = simulate(initialState, testActions, actions, effects);
-
-                    if (testResult.survived || testResult.deathStep > result.deathStep) {
-                        if (score.compareTo(bestScore) > 0) {
-                            bestScore = score;
-                            bestBlocker = action;
-                        }
-                    }
-                }
-            }
-        }
-
-        return bestBlocker;
-    }
 
     /**
-     * Score a blocker: prevented damage + action benefit - action cost,
-     * with extra penalty for crew costs when crew/maxCrew < 0.35.
-     */
-    private BigDecimal scoreBlocker(Action action, Effect effect, Values initialState) {
-        Values actionValues = action.getValues();
-        Values effectValues = effect.getValues();
-
-        BigDecimal preventedDamage = BigDecimal.ZERO;
-        if (effectValues.getHullStrength() != null && effectValues.getHullStrength().compareTo(BigDecimal.ZERO) < 0) {
-            preventedDamage = preventedDamage.add(effectValues.getHullStrength().abs());
-        }
-        if (effectValues.getCrewHealth() != null && effectValues.getCrewHealth().compareTo(BigDecimal.ZERO) < 0) {
-            preventedDamage = preventedDamage.add(effectValues.getCrewHealth().abs());
-        }
-
-        BigDecimal actionBenefit = BigDecimal.ZERO;
-        if (actionValues.getHullStrength() != null && actionValues.getHullStrength().compareTo(BigDecimal.ZERO) > 0) {
-            actionBenefit = actionBenefit.add(actionValues.getHullStrength());
-        }
-        if (actionValues.getCrewHealth() != null && actionValues.getCrewHealth().compareTo(BigDecimal.ZERO) > 0) {
-            actionBenefit = actionBenefit.add(actionValues.getCrewHealth());
-        }
-        if (actionValues.getMaxHullStrength() != null && actionValues.getMaxHullStrength().compareTo(BigDecimal.ZERO) > 0) {
-            actionBenefit = actionBenefit.add(actionValues.getMaxHullStrength().multiply(new BigDecimal("0.1")));
-        }
-        if (actionValues.getMaxCrewHealth() != null && actionValues.getMaxCrewHealth().compareTo(BigDecimal.ZERO) > 0) {
-            actionBenefit = actionBenefit.add(actionValues.getMaxCrewHealth().multiply(new BigDecimal("0.1")));
-        }
-
-        BigDecimal actionCost = BigDecimal.ZERO;
-        if (actionValues.getHullStrength() != null && actionValues.getHullStrength().compareTo(BigDecimal.ZERO) < 0) {
-            actionCost = actionCost.add(actionValues.getHullStrength().abs());
-        }
-        if (actionValues.getCrewHealth() != null && actionValues.getCrewHealth().compareTo(BigDecimal.ZERO) < 0) {
-            BigDecimal crewCost = actionValues.getCrewHealth().abs();
-
-            // Extra penalty for crew costs when crew/maxCrew < 0.35
-            BigDecimal crewRatio = initialState.getCrewHealth().divide(
-                    initialState.getMaxCrewHealth(), 10, BigDecimal.ROUND_HALF_UP);
-
-            if (crewRatio.compareTo(CREW_CRITICAL_RATIO) < 0) {
-                crewCost = crewCost.multiply(new BigDecimal("2.0"));
-            }
-
-            actionCost = actionCost.add(crewCost);
-        }
-
-        return preventedDamage.add(actionBenefit).subtract(actionCost);
-    }
-
-    /**
-     * Find the best heal action.
+     * Find the best heal action with improved scoring.
      */
     private Action findBestHeal(SimulationResult result, Values initialState, List<Action> actions,
                                List<Effect> effects, Set<Long> usedActionIds, List<Long> currentActions) {
         Action bestHeal = null;
         BigDecimal bestScore = BigDecimal.ZERO;
 
+        // Determine what kind of heal we need based on death state
+        boolean needsHullRepair = result.deathState.hullStrength.compareTo(BigDecimal.ZERO) <= 0;
+        boolean needsCrewHeal = result.deathState.crewHealth.compareTo(BigDecimal.ZERO) <= 0;
+
         for (Action action : actions) {
             if (usedActionIds.contains(action.getId())) continue;
             if (action.getValues() == null) continue;
+            if (action.getEffectId() != -1) continue; // Skip blockers
 
             Values v = action.getValues();
             BigDecimal healValue = BigDecimal.ZERO;
 
-            if (v.getHullStrength() != null && v.getHullStrength().compareTo(BigDecimal.ZERO) > 0) {
+            // Prioritize the type of heal we need
+            if (needsHullRepair && v.getHullStrength() != null && v.getHullStrength().compareTo(BigDecimal.ZERO) > 0) {
+                healValue = healValue.add(v.getHullStrength().multiply(new BigDecimal("2.0")));
+            } else if (v.getHullStrength() != null && v.getHullStrength().compareTo(BigDecimal.ZERO) > 0) {
                 healValue = healValue.add(v.getHullStrength());
             }
-            if (v.getCrewHealth() != null && v.getCrewHealth().compareTo(BigDecimal.ZERO) > 0) {
+
+            if (needsCrewHeal && v.getCrewHealth() != null && v.getCrewHealth().compareTo(BigDecimal.ZERO) > 0) {
+                healValue = healValue.add(v.getCrewHealth().multiply(new BigDecimal("3.0")));
+            } else if (v.getCrewHealth() != null && v.getCrewHealth().compareTo(BigDecimal.ZERO) > 0) {
                 healValue = healValue.add(v.getCrewHealth().multiply(new BigDecimal("1.5")));
             }
 
-            // Penalize if action has costs
+            // Also value max increases
+            if (v.getMaxHullStrength() != null && v.getMaxHullStrength().compareTo(BigDecimal.ZERO) > 0) {
+                healValue = healValue.add(v.getMaxHullStrength().multiply(new BigDecimal("0.3")));
+            }
+
+            // Penalize costs more severely
             if (v.getHullStrength() != null && v.getHullStrength().compareTo(BigDecimal.ZERO) < 0) {
-                healValue = healValue.add(v.getHullStrength());
+                healValue = healValue.add(v.getHullStrength().multiply(new BigDecimal("1.5")));
             }
             if (v.getCrewHealth() != null && v.getCrewHealth().compareTo(BigDecimal.ZERO) < 0) {
-                healValue = healValue.add(v.getCrewHealth());
+                healValue = healValue.add(v.getCrewHealth().multiply(new BigDecimal("2.0")));
             }
 
             if (healValue.compareTo(bestScore) > 0) {
-                // Test if this heal saves us
+                // Test if this heal saves us or delays death
                 List<Long> testActions = new ArrayList<>(currentActions);
                 insertActionAtBestPosition(testActions, action.getId(), result.deathStep, actions, effects);
 
