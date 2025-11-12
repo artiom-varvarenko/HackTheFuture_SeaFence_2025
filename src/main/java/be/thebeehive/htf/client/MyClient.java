@@ -56,20 +56,119 @@ public class MyClient implements HtfClientListener {
             return;
         }
 
-        List<Long> chosenActions = planRoundActions(current, actions, effects);
+        // Log current state
+        System.out.printf("\n=== ROUND %d ===%n", msg.getRound());
+        System.out.printf("Current State: Hull=%s/%s (%.1f%%) | Crew=%s/%s (%.1f%%)%n",
+                current.getHullStrength(), current.getMaxHullStrength(),
+                current.getHullStrength().divide(current.getMaxHullStrength(), 4, BigDecimal.ROUND_HALF_UP)
+                        .multiply(new BigDecimal("100")).doubleValue(),
+                current.getCrewHealth(), current.getMaxCrewHealth(),
+                current.getCrewHealth().divide(current.getMaxCrewHealth(), 4, BigDecimal.ROUND_HALF_UP)
+                        .multiply(new BigDecimal("100")).doubleValue());
+
+        // Log harmful effects
+        List<GameRoundServerMessage.Effect> harmfulEffects = findHarmfulEffects(effects);
+        if (!harmfulEffects.isEmpty()) {
+            System.out.printf("THREATS: %d harmful effects detected:%n", harmfulEffects.size());
+            for (GameRoundServerMessage.Effect effect : harmfulEffects) {
+                System.out.printf("  Effect[%d] @ step %d: Hull=%s | Crew=%s%n",
+                        effect.getId(), effect.getStep(),
+                        formatDelta(effect.getValues().getHullStrength()),
+                        formatDelta(effect.getValues().getCrewHealth()));
+            }
+        }
+
+        List<Long> chosenActions = planRoundActionsWithLogging(current, actions, effects, harmfulEffects);
         client.send(new SelectActionsClientMessage(msg.getRoundId(), chosenActions));
 
-        boolean dangerAhead = effects.stream().anyMatch(this::isHarmfulEffect);
+        System.out.printf("RESULT: Chose %d actions: %s%n", chosenActions.size(), chosenActions);
+    }
 
-        System.out.printf(
-                "Round %d | Hull: %s | Crew: %s | Danger: %s | Steps: %d | Chosen: %s%n",
-                msg.getRound(),
-                current.getHullStrength(),
-                current.getCrewHealth(),
-                dangerAhead,
-                chosenActions.size(),
-                chosenActions
-        );
+    private String formatDelta(BigDecimal value) {
+        if (value == null || value.compareTo(BigDecimal.ZERO) == 0) return "0";
+        return (value.compareTo(BigDecimal.ZERO) > 0 ? "+" : "") + value;
+    }
+
+    private List<Long> planRoundActionsWithLogging(GameRoundServerMessage.Values startState,
+                                                   List<GameRoundServerMessage.Action> actions,
+                                                   List<GameRoundServerMessage.Effect> effects,
+                                                   List<GameRoundServerMessage.Effect> harmfulEffects) {
+        List<Long> chosen = new ArrayList<>();
+        Set<Long> usedActionIds = new HashSet<>();
+
+        GameRoundServerMessage.Values simulated = startState;
+        int step = 1;
+
+        // Phase 1: Cancel harmful effects
+        System.out.println("PHASE 1: Blocking threats");
+        for (GameRoundServerMessage.Effect effect : harmfulEffects) {
+            if (step > MAX_ACTIONS_PER_ROUND) break;
+            if (step > effect.getStep()) continue;
+
+            GameRoundServerMessage.Action counter = findCounterAction(effect, actions, usedActionIds);
+            if (counter == null || counter.getValues() == null) {
+                System.out.printf("  Effect[%d] @ step %d: NO BLOCKER AVAILABLE%n", effect.getId(), effect.getStep());
+                continue;
+            }
+
+            GameRoundServerMessage.Values after = ClientUtils.sumValues(simulated, counter.getValues());
+
+            if (ClientUtils.isDead(after)) {
+                System.out.printf("  Effect[%d]: Blocker action[%d] would KILL us (Hull=%s, Crew=%s) - SKIPPING%n",
+                        effect.getId(), counter.getId(),
+                        formatDelta(counter.getValues().getHullStrength()),
+                        formatDelta(counter.getValues().getCrewHealth()));
+                continue;
+            }
+
+            System.out.printf("  Effect[%d]: BLOCKING with action[%d] (Hull=%s, Crew=%s)%n",
+                    effect.getId(), counter.getId(),
+                    formatDelta(counter.getValues().getHullStrength()),
+                    formatDelta(counter.getValues().getCrewHealth()));
+
+            chosen.add(counter.getId());
+            usedActionIds.add(counter.getId());
+            simulated = after;
+            step++;
+        }
+
+        // Phase 2: Beneficial actions
+        System.out.printf("PHASE 2: Beneficial actions (slots available: %d)%n", MAX_ACTIONS_PER_ROUND - step + 1);
+        while (step <= MAX_ACTIONS_PER_ROUND) {
+            GameRoundServerMessage.Action best = chooseBestBeneficialAction(actions, usedActionIds, simulated);
+
+            if (best == null || best.getValues() == null) {
+                System.out.println("  No more beneficial actions available");
+                break;
+            }
+
+            GameRoundServerMessage.Values after = ClientUtils.sumValues(simulated, best.getValues());
+
+            if (ClientUtils.isDead(after)) {
+                System.out.printf("  Best action[%d] would KILL us - STOPPING%n", best.getId());
+                break;
+            }
+
+            BigDecimal score = scoreAction(best.getValues(), simulated);
+            System.out.printf("  Adding action[%d] (score=%.1f, Hull=%s, Crew=%s, MaxHull=%s, MaxCrew=%s)%n",
+                    best.getId(), score.doubleValue(),
+                    formatDelta(best.getValues().getHullStrength()),
+                    formatDelta(best.getValues().getCrewHealth()),
+                    formatDelta(best.getValues().getMaxHullStrength()),
+                    formatDelta(best.getValues().getMaxCrewHealth()));
+
+            chosen.add(best.getId());
+            usedActionIds.add(best.getId());
+            simulated = after;
+            step++;
+        }
+
+        // Show final simulated state
+        System.out.printf("PROJECTED: Hull=%s/%s | Crew=%s/%s%n",
+                simulated.getHullStrength(), simulated.getMaxHullStrength(),
+                simulated.getCrewHealth(), simulated.getMaxCrewHealth());
+
+        return chosen;
     }
 
     /**
